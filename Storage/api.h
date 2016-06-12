@@ -149,7 +149,7 @@ struct RESTfulDataHandlerGenerator {
             [&storage, restful_url_prefix, field_name, data_url_component, schema_url_component](
                 Request request) {
               auto generic_input = RESTfulGenericInput<STORAGE>(
-                  storage, restful_url_prefix, data_url_component, schema_url_component);
+                  storage, restful_url_prefix, data_url_component, schema_url_component, &request.headers);
               if (request.method == "GET") {
                 GETHandler handler;
                 const bool export_requested = request.url.query.has("export");

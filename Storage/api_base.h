@@ -40,16 +40,19 @@ struct RESTfulGenericInput {
   const std::string restful_url_prefix;
   const std::string data_url_component;
   const std::string schema_url_component;
+  const current::net::http::Headers* headers;
 
   explicit RESTfulGenericInput(STORAGE& storage) : storage(storage) {}
   RESTfulGenericInput(STORAGE& storage,
                       const std::string& restful_url_prefix,
                       const std::string& data_url_component,
-                      const std::string& schema_url_component)
+                      const std::string& schema_url_component,
+                      const current::net::http::Headers* headers = nullptr)
       : storage(storage),
         restful_url_prefix(restful_url_prefix),
         data_url_component(data_url_component),
-        schema_url_component(schema_url_component) {}
+        schema_url_component(schema_url_component),
+        headers(headers) {}
   RESTfulGenericInput(const RESTfulGenericInput&) = default;
   RESTfulGenericInput(RESTfulGenericInput&&) = default;
 };

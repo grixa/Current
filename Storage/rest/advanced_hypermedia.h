@@ -81,7 +81,20 @@ struct AdvancedHypermedia : Hypermedia {
   using SUPER = Hypermedia;
 
   template <class HTTP_VERB, typename PARTICULAR_FIELD, typename ENTRY, typename KEY>
-  struct RESTful : SUPER::RESTful<HTTP_VERB, PARTICULAR_FIELD, ENTRY, KEY> {};
+  struct RESTful : SUPER::RESTful<HTTP_VERB, PARTICULAR_FIELD, ENTRY, KEY> {
+    using ACTUAL_SUPER = SUPER::RESTful<HTTP_VERB, PARTICULAR_FIELD, ENTRY, KEY>;
+
+    template <class INPUT>
+    Response Run(const INPUT& input) const {
+      const auto cmp = current::net::http::Header::KeyPrefixComparator("X-");
+      for (const auto& header : *input.headers) {
+        if (cmp(header.header)) {
+          input.fields.SetTransactionMetaField(header.header, header.value);
+        }
+      }
+      return this->ACTUAL_SUPER::template Run<INPUT>(input);
+    }
+  };
 
   template <typename PARTICULAR_FIELD, typename ENTRY, typename KEY>
   struct RESTful<GET, PARTICULAR_FIELD, ENTRY, KEY> {
