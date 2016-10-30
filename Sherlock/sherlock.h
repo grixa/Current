@@ -138,10 +138,7 @@ class StreamImpl {
       try {
         auto& data = *data_;
         current::locks::SmartMutexLockGuard<MLS> lock(data.publish_mutex);
-        // Note: It's a different mutex that is locked, but the persistence layer is owned by this Sherlock stream,
-        //       or the user assumes full responsibility if they use `InternalExposePersister()`.
-        const auto result =
-            data.persistence.template Publish<current::locks::MutexLockStatus::AlreadyLocked>(entry, us);
+        const auto result = data.persistence.Publish(entry, us);
         data.notifier.NotifyAllOfExternalWaitableEvent();
         return result;
       } catch (const current::sync::InDestructingModeException&) {
@@ -154,10 +151,7 @@ class StreamImpl {
       try {
         auto& data = *data_;
         current::locks::SmartMutexLockGuard<MLS> lock(data.publish_mutex);
-        // Note: It's a different mutex that is locked, but the persistence layer is owned by this Sherlock stream,
-        //       or the user assumes full responsibility if they use `InternalExposePersister()`.
-        const auto result =
-            data.persistence.template Publish<current::locks::MutexLockStatus::AlreadyLocked>(std::move(entry), us);
+        const auto result = data.persistence.Publish(std::move(entry), us);
         data.notifier.NotifyAllOfExternalWaitableEvent();
         return result;
       } catch (const current::sync::InDestructingModeException&) {
@@ -170,9 +164,7 @@ class StreamImpl {
       try {
         auto& data = *data_;
         current::locks::SmartMutexLockGuard<MLS> lock(data.publish_mutex);
-        // Note: It's a different mutex that is locked, but the persistence layer is owned by this Sherlock stream,
-        //       or the user assumes full responsibility if they use `InternalExposePersister()`.
-        data.persistence.template UpdateHead<current::locks::MutexLockStatus::AlreadyLocked>(us);
+        data.persistence.UpdateHead(us);
         data.notifier.NotifyAllOfExternalWaitableEvent();
       } catch (const current::sync::InDestructingModeException&) {
         CURRENT_THROW(StreamInGracefulShutdownException());
@@ -408,8 +400,8 @@ class StreamImpl {
           current::WaitableTerminateSignalBulkNotifier::Scope scope(bare_data.notifier, terminate_signal_);
           terminate_signal_.WaitUntil(lock,
                                       [this, &bare_data, &index, &begin_idx, &head]() {
-                                        return terminate_signal_ || bare_data.persistence.template Size<current::locks::MutexLockStatus::AlreadyLocked>() > index ||
-                                               (index > begin_idx && bare_data.persistence.template CurrentHead<current::locks::MutexLockStatus::AlreadyLocked>() > head);
+                                        return terminate_signal_ || bare_data.persistence.Size() > index ||
+                                               (index > begin_idx && bare_data.persistence.CurrentHead() > head);
                                       });
         }
       }
