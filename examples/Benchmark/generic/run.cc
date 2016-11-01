@@ -29,6 +29,8 @@ SOFTWARE.
 #include "scenario_simple_http.h"
 #include "scenario_storage.h"
 #include "scenario_nginx_client.h"
+#include "scenario_spinning_mutex_heavy.h"
+#include "scenario_spinning_mutex_simple.h"
 
 using namespace current;
 
