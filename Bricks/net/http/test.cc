@@ -392,6 +392,81 @@ TEST(PosixHTTPServerTest, ChunkedLargeBodyManyChunks) {
   t.join();
 }
 
+TEST(PosixHTTPServerTest, OneLargeChunkVsALotOfTinyOnes) {
+  string chunked_body = "";
+  string body = "";
+  string chunk(10, '.');
+  for (size_t i = 0; i < 10000; ++i) {
+    for (size_t j = 0; j < 10; ++j) {
+      chunk[j] = 'A' + ((i + j) % 26);
+    }
+    chunked_body += "A\r\n" + chunk + "\r\n";
+    body += chunk;
+  }
+
+  std::chrono::microseconds duration1, duration2;
+  {
+    thread t([](Socket s) {
+      HTTPServerConnection c(s.Accept());
+      EXPECT_EQ("POST", c.HTTPRequest().Method());
+      EXPECT_EQ("/", c.HTTPRequest().RawPath());
+      c.SendHTTPResponse(c.HTTPRequest().Body());
+    }, Socket(FLAGS_net_http_test_port));
+    Connection connection(ClientSocket("localhost", FLAGS_net_http_test_port));
+    auto start = std::chrono::system_clock::now();
+    connection.BlockingWrite("POST / HTTP/1.1\r\n", true);
+    connection.BlockingWrite("Host: localhost\r\n", true);
+    connection.BlockingWrite("Transfer-Encoding: chunked\r\n", true);
+    connection.BlockingWrite("\r\n", true);
+    connection.BlockingWrite(chunked_body, true);
+    connection.BlockingWrite("0\r\n", false);
+    ExpectToReceive(current::strings::Printf(
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: text/plain\r\n"
+                        "Connection: close\r\n"
+                        "Content-Length: %d\r\n"
+                        "\r\n",
+                        static_cast<int>(body.length())) +
+                        body,
+                    connection);
+    duration1 = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now() - start);
+    t.join();
+  }
+
+  {
+    thread t([](Socket s) {
+      HTTPServerConnection c(s.Accept());
+      EXPECT_EQ("POST", c.HTTPRequest().Method());
+      EXPECT_EQ("/", c.HTTPRequest().RawPath());
+      c.SendHTTPResponse(c.HTTPRequest().Body());
+    }, Socket(FLAGS_net_http_test_port));
+    Connection connection(ClientSocket("localhost", FLAGS_net_http_test_port));
+    auto start = std::chrono::system_clock::now();
+    connection.BlockingWrite("POST / HTTP/1.1\r\n", true);
+    connection.BlockingWrite("Host: localhost\r\n", true);
+    connection.BlockingWrite("Transfer-Encoding: chunked\r\n", true);
+    connection.BlockingWrite("\r\n", true);
+    connection.BlockingWrite(current::strings::Printf("%X\r\n", static_cast<int>(body.length())), true);
+    connection.BlockingWrite(body, true);
+    connection.BlockingWrite("0\r\n", false);
+
+    ExpectToReceive(current::strings::Printf(
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: text/plain\r\n"
+                        "Connection: close\r\n"
+                        "Content-Length: %d\r\n"
+                        "\r\n",
+                        static_cast<int>(body.length())) +
+                        body,
+                    connection);
+    duration2 = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now() - start);
+    t.join();
+  }
+
+  EXPECT_LT((double)std::max(duration2.count(), duration1.count()) / std::min(duration2.count(), duration1.count()),
+            5.0);
+}
+
 TEST(PosixHTTPServerTest, InvalidHEXAsChunkSizeDoesNotKillServer) {
   std::atomic_bool wrong_chunk_size_exception_thrown(false);
   thread t([&wrong_chunk_size_exception_thrown](Socket s) {
