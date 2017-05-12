@@ -24,6 +24,7 @@ SOFTWARE.
 
 #include "../../../current.h"
 
+#include "scenario_chunked_http.h"
 #include "scenario_golden_1k_qps.h"
 #include "scenario_json.h"
 #include "scenario_simple_http.h"
