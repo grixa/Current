@@ -37,35 +37,34 @@ DEFINE_uint16(chunked_http_local_port, 9700, "Local port range for `current_http
 DECLARE_uint16(chunked_http_local_port);
 #endif
 
-SCENARIO(current_chunked_http_get_large, "Use Current's HTTP stack for chunked HTTP get.") {
+SCENARIO(current_chunked_http_large, "Use Current's HTTP stack for chunked HTTP get.") {
   std::string body_;
-  std::thread thread_;
+  std::string expected_response_;
+  HTTPRoutesScope scope_;
 
-  std::string GenerateBody() {
-    std::string res = "";
+  current_chunked_http_large() {
     std::string chunk(10, '.');
     for (size_t i = 0; i < 10000; ++i) {
       for (size_t j = 0; j < 10; ++j) {
         chunk[j] = 'A' + ((i + j) % 26);
       }
-      res += chunk;
+      body_ += chunk;
     }
-    return res;
-  }
 
-  current_chunked_http_get_large()
-      : body_(GenerateBody()),
-        thread_([]() {
-          for (;;) {
-            try {
-              current::net::Socket s(FLAGS_chunked_http_local_port);
-              current::net::HTTPServerConnection c(s.Accept());
-              c.SendHTTPResponse(c.HTTPRequest().Body());
-            } catch (const current::Exception&) {
-              break;
-            }
-          }
-        }) {}
+    size_t count = std::count(body_.begin(), body_.end(), 'E');
+    std::string count_string = current::ToString(count);
+    expected_response_ = current::strings::Printf(
+                             "HTTP/1.1 200 OK\r\n"
+                             "Content-Type: text/plain\r\n"
+                             "Connection: close\r\n"
+                             "Content-Length: %d\r\n"
+                             "\r\n",
+                             static_cast<int>(count_string.length())) +
+                         count_string;
+
+    const auto handler = [](Request r) { r(current::ToString(std::count(r.body.begin(), r.body.end(), 'E'))); };
+    scope_ += HTTP(FLAGS_chunked_http_local_port).Register("/", handler);
+  }
 
   void RunOneQuery() override {
     current::net::Connection connection(current::net::ClientSocket("localhost", FLAGS_chunked_http_local_port));
@@ -76,61 +75,43 @@ SCENARIO(current_chunked_http_get_large, "Use Current's HTTP stack for chunked H
     connection.BlockingWrite(current::strings::Printf("%X\r\n", static_cast<int>(body_.length())), true);
     connection.BlockingWrite(body_, true);
     connection.BlockingWrite("0\r\n", false);
-    std::vector<char> response(body_.length());
-    connection.BlockingRead(&response[0], body_.length(), current::net::Connection::FillFullBuffer);
-  }
-
-  ~current_chunked_http_get_large() {
-    { current::net::Connection connection(current::net::ClientSocket("localhost", FLAGS_chunked_http_local_port)); }
-    thread_.join();
+    std::vector<char> response(expected_response_.length() + 1);
+    connection.BlockingRead(&response[0], expected_response_.length(), current::net::Connection::FillFullBuffer);
   }
 };
 
-REGISTER_SCENARIO(current_chunked_http_get_large);
+REGISTER_SCENARIO(current_chunked_http_large);
 
-SCENARIO(current_chunked_http_get_tiny, "Use Current's HTTP stack for chunked HTTP get.") {
-  std::string body_;
+SCENARIO(current_chunked_http_tiny, "Use Current's HTTP stack for chunked HTTP get.") {
   std::string chunked_body_;
-  std::thread thread_;
+  std::string expected_response_;
+  HTTPRoutesScope scope_;
 
-  std::string GenerateChunkedBody() {
-    std::string res = "";
+  current_chunked_http_tiny() {
     std::string chunk(10, '.');
+    std::string body;
     for (size_t i = 0; i < 10000; ++i) {
       for (size_t j = 0; j < 10; ++j) {
         chunk[j] = 'A' + ((i + j) % 26);
       }
-      res += "A\r\n" + chunk + "\r\n";
+      chunked_body_ += "A\r\n" + chunk + "\r\n";
+      body += chunk;
     }
-    return res;
-  }
 
-  std::string GenerateBody() {
-    std::string res = "";
-    std::string chunk(10, '.');
-    for (size_t i = 0; i < 10000; ++i) {
-      for (size_t j = 0; j < 10; ++j) {
-        chunk[j] = 'A' + ((i + j) % 26);
-      }
-      res += chunk;
-    }
-    return res;
-  }
+    size_t count = std::count(body.begin(), body.end(), 'E');
+    std::string count_string = current::ToString(count);
+    expected_response_ = current::strings::Printf(
+                             "HTTP/1.1 200 OK\r\n"
+                             "Content-Type: text/plain\r\n"
+                             "Connection: close\r\n"
+                             "Content-Length: %d\r\n"
+                             "\r\n",
+                             static_cast<int>(count_string.length())) +
+                         count_string;
 
-  current_chunked_http_get_tiny()
-      : body_(GenerateBody()),
-        chunked_body_(GenerateChunkedBody()),
-        thread_([]() {
-          for (;;) {
-            try {
-              current::net::Socket s(FLAGS_chunked_http_local_port);
-              current::net::HTTPServerConnection c(s.Accept());
-              c.SendHTTPResponse(c.HTTPRequest().Body());
-            } catch (const current::Exception&) {
-              break;
-            }
-          }
-        }) {}
+    const auto handler = [](Request r) { r(current::ToString(std::count(r.body.begin(), r.body.end(), 'E'))); };
+    scope_ += HTTP(FLAGS_chunked_http_local_port).Register("/", handler);
+  }
 
   void RunOneQuery() override {
     current::net::Connection connection(current::net::ClientSocket("localhost", FLAGS_chunked_http_local_port));
@@ -140,16 +121,11 @@ SCENARIO(current_chunked_http_get_tiny, "Use Current's HTTP stack for chunked HT
     connection.BlockingWrite("\r\n", true);
     connection.BlockingWrite(chunked_body_, true);
     connection.BlockingWrite("0\r\n", false);
-    std::vector<char> response(body_.length());
-    connection.BlockingRead(&response[0], body_.length(), current::net::Connection::FillFullBuffer);
-  }
-
-  ~current_chunked_http_get_tiny() {
-    { current::net::Connection connection(current::net::ClientSocket("localhost", FLAGS_chunked_http_local_port)); }
-    thread_.join();
+    std::vector<char> response(expected_response_.length() + 1);
+    connection.BlockingRead(&response[0], expected_response_.length(), current::net::Connection::FillFullBuffer);
   }
 };
 
-REGISTER_SCENARIO(current_chunked_http_get_tiny);
+REGISTER_SCENARIO(current_chunked_http_tiny);
 
 #endif  // BENCHMARK_SCENARIO_CHUNKED_HTTP_H
