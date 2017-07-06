@@ -107,13 +107,21 @@ class MemoryPersister {
     IteratorUnsafe(ScopeOwned<Container>& container, uint64_t i)
         : container_(container, [this]() { valid_ = false; }), i_(i) {}
 
-    std::string operator*() const {
+    struct Entry {
+      std::string idx_ts;
+      std::string entry;
+      
+      Entry() = delete;
+      Entry(std::string entry) : entry(std::move(entry)) {}
+    };
+
+    Entry operator*() const {
       if (!valid_) {
         CURRENT_THROW(PersistenceMemoryBlockNoLongerAvailable());
       }
       std::lock_guard<std::mutex> lock(container_->mutex_ref);
       const auto& entry = container_->entries[i_];
-      return JSON(idxts_t(i_, entry.first)) + '\t' + JSON(entry.second);
+      return Entry(JSON(idxts_t(i_, entry.first)) + '\t' + JSON(entry.second));
     }
     IteratorUnsafe& operator++() {
       if (!valid_) {

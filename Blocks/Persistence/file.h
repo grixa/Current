@@ -324,6 +324,11 @@ class FilePersister {
 
   class IteratorUnsafe final {
    public:
+    struct Entry {
+      std::string idx_ts;
+      std::string entry;
+    };
+
     IteratorUnsafe() = delete;
     IteratorUnsafe(const IteratorUnsafe&) = delete;
     IteratorUnsafe(IteratorUnsafe&&) = default;
@@ -347,19 +352,20 @@ class FilePersister {
 
     // `operator*` relies on the fact each entry will be requested at most once.
     // The range-based for-loop works fine. -- D.K.
-    std::string operator*() const {
+    Entry operator*() const {
       if (!valid_) {
         CURRENT_THROW(
             PersistenceFileNoLongerAvailable(file_persister_impl_.ObjectAccessorDespitePossiblyDestructing().filename));
       }
-      if (current_entry_.empty()) {
+      if (current_entry_.entry.empty()) {
         const auto offset = file_persister_impl_->offset[i_];
         if (offset != current_offset_) {
           fi_->seekg(offset, std::ios_base::beg);
           current_offset_ = offset;
         }
-        if (std::getline(*fi_, current_entry_)) {
-          CURRENT_ASSERT(current_entry_[0] != constants::kDirectiveMarker);
+        std::string line;
+        if (std::getline(*fi_, current_entry_.entry)) {
+          CURRENT_ASSERT(current_entry_.entry[0] != constants::kDirectiveMarker);
         } else {
           // End of file. Should never happen as long as the user only iterates over valid ranges.
           CURRENT_THROW(current::Exception());  // LCOV_EXCL_LINE
@@ -374,7 +380,7 @@ class FilePersister {
             PersistenceFileNoLongerAvailable(file_persister_impl_.ObjectAccessorDespitePossiblyDestructing().filename));
       }
       ++i_;
-      current_entry_.clear();
+      current_entry_.entry.clear();
       return *this;
     }
     bool operator==(const IteratorUnsafe& rhs) const { return i_ == rhs.i_; }
@@ -386,7 +392,7 @@ class FilePersister {
     bool valid_ = true;
     std::unique_ptr<std::ifstream> fi_;
     uint64_t i_;
-    mutable std::string current_entry_;
+    mutable Entry current_entry_;
     mutable std::streampos current_offset_;
   };
 
