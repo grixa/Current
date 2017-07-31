@@ -155,6 +155,7 @@ class FilePersister {
     std::mutex& publish_mutex_ref_;  // Guards `record_offset_`, `head_offset_` and `record_timestamp_`.
     std::vector<std::streampos> record_offset_;
     std::streampos head_offset_;
+    uint64_t cache_size_;
     std::vector<std::chrono::microseconds> record_timestamp_;
 
     // Just `std::atomic<end_t> end_;` won't work in g++ until 5.1, ref.
@@ -170,12 +171,14 @@ class FilePersister {
 
     FilePersisterImpl(std::mutex& publish_mutex_ref,
                       const ss::StreamNamespaceName& namespace_name,
-                      const std::string& filename)
+                      const std::string& filename,
+                      const uint64_t read_cache_size = 1024 * 1024)
         : filename_(filename),
           file_appender_(filename, std::ofstream::app | std::ofstream::ate),
           head_rewriter_(filename, std::ofstream::in | std::ofstream::out),
           publish_mutex_ref_(publish_mutex_ref),
-          head_offset_(0) {
+          head_offset_(0),
+          cache_size_(read_cache_size) {
       ValidateFileAndInitializeHead(namespace_name);
       if (file_appender_.bad() || head_rewriter_.bad()) {
         CURRENT_THROW(PersistenceFileNotWritable(filename));
@@ -346,7 +349,11 @@ class FilePersister {
                    uint64_t i,
                    std::streampos offset,
                    uint64_t)
-        : file_persister_impl_(std::move(file_persister_impl)), i_(i), current_offset_(offset) {
+        : file_persister_impl_(std::move(file_persister_impl)),
+          i_(i),
+          current_offset_(0),
+          next_offset_(0),
+          cache_size_(0) {
       if (!filename.empty()) {
         fi_ = std::make_unique<std::ifstream>(filename);
         CURRENT_ASSERT(!fi_->bad());
@@ -359,25 +366,40 @@ class FilePersister {
     // `operator*` relies on the fact each entry will be requested at most once.
     // The range-based for-loop works fine. -- D.K.
     std::string operator*() const {
-      if (current_entry_.empty()) {
-        const auto offset = file_persister_impl_->record_offset_[i_];
-        if (offset != current_offset_) {
-          fi_->seekg(offset, std::ios_base::beg);
-          current_offset_ = offset;
-        }
-        if (std::getline(*fi_, current_entry_)) {
-          CURRENT_ASSERT(current_entry_[0] != constants::kDirectiveMarker);
-        } else {
-          // End of file. Should never happen as long as the user only iterates over valid ranges.
-          CURRENT_THROW(current::Exception());  // LCOV_EXCL_LINE
+      if (!cache_size_) {
+        cache_.resize(file_persister_impl_->cache_size_);
+      }
+      while (current_offset_ == next_offset_) {
+        next_offset_ =
+            std::find(cache_.begin() + current_offset_, cache_.begin() + cache_size_, '\n') - cache_.begin() + 1;
+        if (next_offset_ == cache_size_ + 1) {
+          size_t carried_over_bytes = 0;
+          if (current_offset_ < cache_size_) {
+            carried_over_bytes = cache_size_ - current_offset_;
+            if (current_offset_) {
+              memmove(&cache_[0], &cache_[current_offset_], carried_over_bytes);
+            } else if (carried_over_bytes == cache_.size()) {
+              cache_.resize(std::max(static_cast<size_t>(cache_.size() * 1.9), cache_.size() + 1));
+            }
+          }
+          fi_->read(&cache_[carried_over_bytes], cache_.size() - carried_over_bytes);
+          const auto actually_read = fi_->gcount();
+          if (!actually_read) {
+            // End of file. Should never happen as long as the user only iterates over valid ranges.
+            CURRENT_THROW(current::Exception());
+          }
+          cache_size_ = carried_over_bytes + actually_read;
+          current_offset_ = next_offset_ = 0;
+        } else if (cache_[current_offset_] == constants::kDirectiveMarker) {
+          current_offset_ = next_offset_;
         }
       }
-      return current_entry_;
+      return std::string(&cache_[current_offset_], next_offset_ - current_offset_ - 1);
     }
 
     IteratorUnsafe& operator++() {
       ++i_;
-      current_entry_.clear();
+      current_offset_ = next_offset_;
       return *this;
     }
     bool operator==(const IteratorUnsafe& rhs) const { return i_ == rhs.i_; }
@@ -389,8 +411,10 @@ class FilePersister {
     bool valid_ = true;
     std::unique_ptr<std::ifstream> fi_;
     uint64_t i_;
-    mutable std::string current_entry_;
-    mutable std::streampos current_offset_;
+    mutable size_t current_offset_;
+    mutable size_t next_offset_;
+    mutable std::vector<char> cache_;
+    mutable size_t cache_size_;
   };
 
   template <typename ITERATOR>
