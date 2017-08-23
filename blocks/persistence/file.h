@@ -336,6 +336,7 @@ class FilePersister {
     uint64_t i_;
   };
 
+#ifdef ITERATOR_CACHE
   class IteratorUnsafe final {
    public:
     IteratorUnsafe() = delete;
@@ -416,6 +417,67 @@ class FilePersister {
     mutable std::vector<char> cache_;
     mutable size_t cache_size_;
   };
+#else
+  class IteratorUnsafe final {
+  public:
+    IteratorUnsafe() = delete;
+    IteratorUnsafe(const IteratorUnsafe&) = delete;
+    IteratorUnsafe(IteratorUnsafe&&) = default;
+    IteratorUnsafe& operator=(const IteratorUnsafe&) = delete;
+    IteratorUnsafe& operator=(IteratorUnsafe&&) = default;
+    
+    IteratorUnsafe(Borrowed<FilePersisterImpl> file_persister_impl,
+                   const std::string& filename,
+                   uint64_t i,
+                   std::streampos offset,
+                   uint64_t)
+    : file_persister_impl_(std::move(file_persister_impl)), i_(i), current_offset_(offset) {
+      if (!filename.empty()) {
+        fi_ = std::make_unique<std::ifstream>(filename);
+        CURRENT_ASSERT(!fi_->bad());
+        if (offset) {
+          fi_->seekg(offset, std::ios_base::beg);
+        }
+      }
+    }
+    
+    // `operator*` relies on the fact each entry will be requested at most once.
+    // The range-based for-loop works fine. -- D.K.
+    std::string operator*() const {
+      if (current_entry_.empty()) {
+        const auto offset = file_persister_impl_->record_offset_[i_];
+        if (offset != current_offset_) {
+          fi_->seekg(offset, std::ios_base::beg);
+          current_offset_ = offset;
+        }
+        if (std::getline(*fi_, current_entry_)) {
+          CURRENT_ASSERT(current_entry_[0] != constants::kDirectiveMarker);
+        } else {
+          // End of file. Should never happen as long as the user only iterates over valid ranges.
+          CURRENT_THROW(current::Exception());  // LCOV_EXCL_LINE
+        }
+      }
+      return current_entry_;
+    }
+    
+    IteratorUnsafe& operator++() {
+      ++i_;
+      current_entry_.clear();
+      return *this;
+    }
+    bool operator==(const IteratorUnsafe& rhs) const { return i_ == rhs.i_; }
+    bool operator!=(const IteratorUnsafe& rhs) const { return !operator==(rhs); }
+    operator bool() const { return file_persister_impl_; }
+    
+  private:
+    Borrowed<FilePersisterImpl> file_persister_impl_;
+    bool valid_ = true;
+    std::unique_ptr<std::ifstream> fi_;
+    uint64_t i_;
+    mutable std::string current_entry_;
+    mutable std::streampos current_offset_;
+  };
+#endif
 
   template <typename ITERATOR>
   class IterableRangeImpl {
