@@ -505,7 +505,9 @@ class MasterFlipController final {
   using entry_t = typename stream_t::entry_t;
   using publisher_t = typename stream_t::publisher_t;
 
-  MasterFlipController(Owned<STREAM>&& stream) : stream_(std::move(stream)) {}
+  MasterFlipController(Owned<STREAM>&& stream) : owned_stream_(std::move(stream)), stream_(Value(owned_stream_)) {}
+
+  MasterFlipController(Borrowed<STREAM> stream) : stream_(std::move(stream)) {}
 
   uint64_t ExposeViaHTTP(uint16_t port,
                          const std::string& route,
@@ -575,12 +577,14 @@ class MasterFlipController final {
   }
 
   bool IsMasterStream() const { return stream_->IsMasterStream(); }
-  stream_t& Stream() { return *Value(stream_); }
-  const stream_t& Stream() const { return *Value(stream_); }
   stream_t& operator*() { return *Value(stream_); }
   const stream_t& operator*() const { return *Value(stream_); }
   stream_t* operator->() { return stream_.operator->(); }
   const stream_t* operator->() const { return stream_.operator->(); }
+
+  Borrowed<stream_t> BorrowStream() const { return stream_; }
+  const WeakBorrowed<stream_t>& Stream() const { return stream_; }
+  WeakBorrowed<stream_t>& Stream() { return stream_; }
 
  private:
   void MasterFlipRequest(Request& r) {
@@ -783,7 +787,8 @@ class MasterFlipController final {
     }
   };
 
-  Owned<stream_t> stream_;
+  Optional<Owned<stream_t>> owned_stream_;
+  Borrowed<stream_t> stream_;
   Optional<Borrowed<publisher_t>> borrowed_publisher_;
   std::unique_ptr<ExposedStreamState> exposed_via_http_;
   std::unique_ptr<RemoteStreamFollower> remote_follower_;
