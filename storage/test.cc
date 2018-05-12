@@ -3084,10 +3084,11 @@ TEST(TransactionalStorage, UseExternallyProvidedStreamStream) {
   using namespace transactional_storage_test;
   using storage_t = TestStorage<StreamInMemoryStreamPersister>;
 
-  static_assert(std::is_same<typename storage_t::persister_t::stream_t,
-                             current::stream::Stream<typename storage_t::persister_t::transaction_t,
-                                                       current::persistence::Memory>>::value,
-                "");
+  static_assert(
+      std::is_same<
+          typename storage_t::persister_t::stream_t,
+          current::stream::Stream<typename storage_t::persister_t::transaction_t, current::persistence::Memory>>::value,
+      "");
 
   auto storage = storage_t::CreateMasterStorage();
 
@@ -3133,7 +3134,7 @@ TEST(TransactionalStorage, UseExternallyProvidedStreamStreamOfBroaderType) {
 
   static_assert(std::is_same<typename storage_t::persister_t::stream_t,
                              current::stream::Stream<Variant<transaction_t, StreamEntryOutsideStorage>,
-                                                       current::persistence::Memory>>::value,
+                                                     current::persistence::Memory>>::value,
                 "");
 
   auto owned_stream = storage_t::stream_t::CreateStream();
@@ -3300,7 +3301,7 @@ TEST(TransactionalStorage, FollowingStorageFlipsToMaster) {
 
   // `FlipToMaster()` method on a storage with `Master` role throws an exception.
   EXPECT_TRUE(master_storage->IsMasterStorage());
-  EXPECT_THROW(master_storage->FlipToMaster(), current::storage::StorageIsAlreadyMasterException);
+  EXPECT_THROW(master_storage->FlipToMaster(0 /*secret_flip_key*/), current::storage::StorageIsAlreadyMasterException);
 
   EXPECT_FALSE(follower_storage->IsMasterStorage());
 
@@ -3311,10 +3312,152 @@ TEST(TransactionalStorage, FollowingStorageFlipsToMaster) {
   EXPECT_FALSE(follower_storage->IsMasterStorage());
 
   // Switch to a `Master` role.
-  ASSERT_NO_THROW(follower_storage->FlipToMaster());
+  ASSERT_NO_THROW(follower_storage->FlipToMaster(0 /*secret_flip_key*/));
 
   // NOTE(dkorolev): This is not implemented yet, `master_storage` will remain the "master" of its own stream.
   // EXPECT_FALSE(master_storage->IsMasterStorage());  // <--- THIS IS UNIMPLEMENTED FOR NOW. -- D.K.
+  EXPECT_TRUE(follower_storage->IsMasterStorage());
+
+  // Publish record and check that everything goes well.
+  current::time::SetNow(std::chrono::microseconds(200));
+  {
+    const auto result = follower_storage->ReadWriteTransaction([](MutableFields<storage_t> fields) {
+      fields.user.Add(SimpleUser("max", "MZ"));
+    }).Go();
+    EXPECT_TRUE(WasCommitted(result));
+  }
+  current::time::SetNow(std::chrono::microseconds(300));
+  {
+    // Publish one more record using REST.
+    const auto post_response = HTTP(POST(base_url + "/api/data/user", SimpleUser("dima", "DK")));
+    EXPECT_EQ(201, static_cast<int>(post_response.code));
+    const auto user_key = post_response.body;
+
+    // Ensure that all the records are in place.
+    const auto result = follower_storage->ReadOnlyTransaction([user_key](ImmutableFields<storage_t> fields) {
+      EXPECT_EQ(3u, fields.user.Size());
+      ASSERT_TRUE(Exists(fields.user["max"]));
+      EXPECT_EQ("MZ", Value(fields.user["max"]).name);
+      ASSERT_TRUE(Exists(fields.user[user_key]));
+      EXPECT_EQ("DK", Value(fields.user[user_key]).name);
+    }).Go();
+    EXPECT_TRUE(WasCommitted(result));
+  }
+}
+
+TEST(TransactionalStorage, FollowingStorageFlipsToMasterViaHTTP) {
+  current::time::ResetToZero();
+
+  using namespace transactional_storage_test;
+  using storage_t = SimpleStorage<StreamStreamPersister>;
+
+  const std::string master_file_name = current::FileSystem::JoinPath(FLAGS_transactional_storage_test_tmpdir, "master");
+  const auto master_file_remover = current::FileSystem::ScopedRmFile(master_file_name);
+
+  const std::string follower_file_name =
+      current::FileSystem::JoinPath(FLAGS_transactional_storage_test_tmpdir, "follower");
+  const auto follower_file_remover = current::FileSystem::ScopedRmFile(follower_file_name);
+
+  // The underlying stream is created and owned by `master_storage`.
+  auto master_stream = storage_t::stream_t::CreateStream(master_file_name);
+  auto master_storage = storage_t::CreateMasterStorageAtopExistingStream(master_stream);
+  const auto flip_key = master_storage->ExposeRawLogViaHTTP(FLAGS_transactional_storage_test_port + 1, "/exposed");
+
+  const auto base_url_raw =
+      current::strings::Printf("http://localhost:%d/exposed", FLAGS_transactional_storage_test_port + 1);
+  // The followering storage is created atop a stream with external data authority.
+  auto follower_storage = storage_t::CreateFollowingStorageReplicatingRemoteStream(
+      base_url_raw, current::stream::SubscriptionMode::Checked, follower_file_name);
+
+  EXPECT_TRUE(master_storage->IsMasterStorage());
+  EXPECT_FALSE(follower_storage->IsMasterStorage());
+
+  const auto base_url = current::strings::Printf("http://localhost:%d", FLAGS_transactional_storage_test_port);
+
+  // Start RESTful service atop follower storage.
+  auto rest = RESTfulStorage<storage_t>(
+      *follower_storage, FLAGS_transactional_storage_test_port, "/api", "http://unittest.current.ai");
+
+  // Launch the continuous replication process.
+  {
+    // Confirm an empty collection is returned.
+    {
+      const auto result = HTTP(GET(base_url + "/api/data/user"));
+      EXPECT_EQ(200, static_cast<int>(result.code));
+      EXPECT_EQ("", result.body);
+    }
+
+    // Publish one record.
+    current::time::SetNow(std::chrono::microseconds(100));
+    {
+      const auto result = master_storage->ReadWriteTransaction([](MutableFields<storage_t> fields) {
+        fields.user.Add(SimpleUser("John", "JD"));
+      }).Go();
+      EXPECT_TRUE(WasCommitted(result));
+    }
+
+    // Wait until the transaction performed above is replicated to the `follower_stream` and imported by
+    // the `follower_storage`.
+    {
+      size_t user_size;
+      user_size = 0u;
+      do {
+        const auto result = follower_storage->ReadOnlyTransaction([](ImmutableFields<storage_t> fields) {
+          return fields.user.Size();
+        }).Go();
+        EXPECT_TRUE(WasCommitted(result));
+        user_size = Value(result);
+      } while (user_size == 0u);
+      EXPECT_EQ(1u, user_size);
+    }
+
+    // Check that the the following storage now has the same record as the master one.
+    {
+      const auto result = follower_storage->ReadOnlyTransaction([](ImmutableFields<storage_t> fields) {
+        ASSERT_TRUE(Exists(fields.user["John"]));
+        EXPECT_EQ("JD", Value(fields.user["John"]).name);
+      }).Go();
+      EXPECT_TRUE(WasCommitted(result));
+    }
+    {
+      const auto result = HTTP(GET(base_url + "/api/data/user/John"));
+      EXPECT_EQ(200, static_cast<int>(result.code));
+      EXPECT_EQ("JD", ParseJSON<SimpleUser>(result.body).name);
+    }
+
+    // Mutating access to the RESTful service of the `follower` is not allowed.
+    {
+      const auto post_response = HTTP(POST(base_url + "/api/data/user", SimpleUser("max", "MZ")));
+      EXPECT_EQ(405, static_cast<int>(post_response.code));
+      const auto put_response = HTTP(PUT(base_url + "/api/data/user/John", SimpleUser("John", "DJ")));
+      EXPECT_EQ(405, static_cast<int>(post_response.code));
+      const auto delete_response = HTTP(DELETE(base_url + "/api/data/user/John"));
+      EXPECT_EQ(405, static_cast<int>(post_response.code));
+    }
+
+    // Attempt to run read-write transaction in `Follower` mode throws an exception.
+    EXPECT_THROW(follower_storage->ReadWriteTransaction([](MutableFields<storage_t>) {}),
+                 current::storage::ReadWriteTransactionInFollowerStorageException);
+    EXPECT_THROW(follower_storage->ReadWriteTransaction([](MutableFields<storage_t>) { return 42; }, [](int) {}),
+                 current::storage::ReadWriteTransactionInFollowerStorageException);
+
+    // At this moment the content of both persisted files must be identical.
+    EXPECT_EQ(current::FileSystem::ReadFileAsString(master_file_name),
+              current::FileSystem::ReadFileAsString(follower_file_name));
+  }
+
+  // `FlipToMaster()` method on a storage with `Master` role throws an exception.
+  EXPECT_TRUE(master_storage->IsMasterStorage());
+  EXPECT_THROW(master_storage->FlipToMaster(0 /*secret_flip_key*/), current::storage::StorageIsAlreadyMasterException);
+
+  EXPECT_FALSE(follower_storage->IsMasterStorage());
+  EXPECT_TRUE(master_storage->IsMasterStorage());
+
+  // Switch to a `Master` role.
+  //	ASSERT_NO_THROW(follower_storage->FlipToMaster(flip_key));
+  follower_storage->FlipToMaster(flip_key);
+
+  EXPECT_FALSE(master_storage->IsMasterStorage());
   EXPECT_TRUE(follower_storage->IsMasterStorage());
 
   // Publish record and check that everything goes well.

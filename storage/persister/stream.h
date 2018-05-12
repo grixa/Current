@@ -30,6 +30,7 @@ SOFTWARE.
 #include "../base.h"
 #include "../exceptions.h"
 #include "../transaction.h"
+#include "../../stream/replicator.h"
 #include "../../stream/stream.h"
 
 #include "../../bricks/sync/locks.h"
@@ -44,9 +45,10 @@ class StreamStreamPersisterImpl final {
   using variant_t = MUTATIONS_VARIANT;
   using transaction_t = Transaction<variant_t>;
   using stream_entry_t = typename std::conditional<std::is_same<STREAM_RECORD_TYPE, NoCustomPersisterParam>::value,
-                                                     transaction_t,
-                                                     STREAM_RECORD_TYPE>::type;
+                                                   transaction_t,
+                                                   STREAM_RECORD_TYPE>::type;
   using stream_t = stream::Stream<stream_entry_t, UNDERLYING_PERSISTER>;
+  using controller_t = stream::MasterFlipController<stream_t>;
   using fields_update_function_t = std::function<void(const variant_t&)>;
 
   struct StreamSubscriberImpl {
@@ -77,8 +79,8 @@ class StreamStreamPersisterImpl final {
   StreamStreamPersisterImpl(Master, fields_update_function_t f, Borrowed<stream_t> stream)
       : fields_update_f_(f),
         stream_publishing_mutex_ref_(stream->Impl()->publishing_mutex),
-        stream_(std::move(stream)),
-        publisher_used_(stream_->BecomeFollowingStream()) {
+        stream_controller_(stream),
+        publisher_used_(stream_controller_->BecomeFollowingStream()) {
     subscriber_instance_ = std::make_unique<StreamSubscriber>(
         [this](const transaction_t& transaction, std::chrono::microseconds timestamp) {
           std::lock_guard<std::mutex> lock(stream_publishing_mutex_ref_);
@@ -91,12 +93,29 @@ class StreamStreamPersisterImpl final {
   StreamStreamPersisterImpl(Following, fields_update_function_t f, Borrowed<stream_t> stream)
       : fields_update_f_(f),
         stream_publishing_mutex_ref_(stream->Impl()->publishing_mutex),
-        stream_(std::move(stream)) {
+        stream_controller_(stream) {
     subscriber_instance_ = std::make_unique<StreamSubscriber>(
         [this](const transaction_t& transaction, std::chrono::microseconds timestamp) {
           std::lock_guard<std::mutex> lock(stream_publishing_mutex_ref_);
           ApplyMutationsFromLockedSectionOrConstructor(transaction, timestamp);
         });
+    std::lock_guard<std::mutex> lock(stream_publishing_mutex_ref_);
+    SubscribeToStreamFromLockedSection();
+  }
+
+  StreamStreamPersisterImpl(const std::string& url,
+                            stream::SubscriptionMode mode,
+                            fields_update_function_t f,
+                            Borrowed<stream_t> stream)
+      : fields_update_f_(f),
+        stream_publishing_mutex_ref_(stream->Impl()->publishing_mutex),
+        stream_controller_(stream) {
+    subscriber_instance_ = std::make_unique<StreamSubscriber>(
+        [this](const transaction_t& transaction, std::chrono::microseconds timestamp) {
+          std::lock_guard<std::mutex> lock(stream_publishing_mutex_ref_);
+          ApplyMutationsFromLockedSectionOrConstructor(transaction, timestamp);
+        });
+    stream_controller_.FollowRemoteStream(url, mode);
     std::lock_guard<std::mutex> lock(stream_publishing_mutex_ref_);
     SubscribeToStreamFromLockedSection();
   }
@@ -139,15 +158,27 @@ class StreamStreamPersisterImpl final {
     journal.Clear();
   }
 
-  void ExposeRawLogViaHTTP(uint16_t port, const std::string& route) {
-    handlers_scope_ += HTTP(port).Register(route,
-                                           URLPathArgs::CountMask::None | URLPathArgs::CountMask::One,
-                                           [this](Request r) { (*Borrowed<stream_t>(stream_))(std::move(r)); });
+  uint64_t ExposeRawLogViaHTTP(uint16_t port,
+                               const std::string& route,
+                               stream::MasterFlipRestrictions restrictions,
+                               std::function<void()> flip_started,
+                               std::function<void()> flip_finished,
+                               std::function<void()> flip_canceled) {
+    return stream_controller_.ExposeViaHTTP(port,
+                                            route,
+                                            restrictions,
+                                            [this, flip_started]() { FlipStarted(flip_started); },
+                                            [this, flip_finished]() { FlipFinished(flip_finished); },
+                                            [this, flip_canceled]() { FlipCanceled(flip_canceled); });
   }
 
-  Borrowed<stream_t> BorrowStream() const { return stream_; }
-  const WeakBorrowed<stream_t>& Stream() const { return stream_; }
-  WeakBorrowed<stream_t>& Stream() { return stream_; }
+  void FollowRemoteStream(const std::string& url, stream::SubscriptionMode mode) {
+    stream_controller_.FollowRemoteStream(url, mode);
+  }
+
+  Borrowed<stream_t> BorrowStream() const { return stream_controller_.BorrowStream(); }
+  const WeakBorrowed<stream_t>& Stream() const { return stream_controller_.Stream(); }
+  WeakBorrowed<stream_t>& Stream() { return stream_controller_.Stream(); }
 
   template <current::locks::MutexLockStatus MLS = current::locks::MutexLockStatus::NeedToLock>
   Borrowed<typename stream_t::publisher_t> PublisherUsed() {
@@ -158,29 +189,32 @@ class StreamStreamPersisterImpl final {
 
   // Note: `BecomeMasterStorage` can not be called from a locked section, as terminating the subscriber
   // is by itself an operation that locks the publishing mutex of the stream -- in the destructor.
-  void BecomeMasterStorage() {
+  void BecomeMasterStorage(uint64_t secret_flip_key) {
     std::lock_guard<std::mutex> master_follower_change_lock(master_follower_change_mutex_);
     if (Exists(publisher_used_)) {
       CURRENT_THROW(StorageIsAlreadyMasterException());
     } else {
+      try {
+        stream_controller_.FlipToMaster(secret_flip_key);
+      } catch (const stream::StreamDoesNotFollowAnyoneException&) {
+      }
       TerminateStreamSubscriptionFromLockedSection();
       std::lock_guard<std::mutex> lock(stream_publishing_mutex_ref_);
-      publisher_used_ = nullptr;
-      publisher_used_ = stream_->template BecomeFollowingStream<current::locks::MutexLockStatus::AlreadyLocked>();
+      publisher_used_ = nullptr;  // Why?
+      publisher_used_ =
+          stream_controller_->template BecomeFollowingStream<current::locks::MutexLockStatus::AlreadyLocked>();
       const uint64_t save_replay_index = subscriber_instance_->next_replay_index_;
       subscriber_instance_ = nullptr;
       SyncReplayStreamFromLockedSectionOrConstructor(save_replay_index);
     }
   }
 
-  // TODO(dkorolev): `BecomeFollowingStorage` maybe?
-
  private:
   // Invariant: both `subscriber_creator_destructor_mutex_` and `stream_publishing_mutex_ref_` are locked,
   // or the call is taking place from the constructor.
   void SyncReplayStreamFromLockedSectionOrConstructor(uint64_t from_idx) {
     for (const auto& stream_record :
-         stream_->Data()->template Iterate<current::locks::MutexLockStatus::AlreadyLocked>(from_idx)) {
+         stream_controller_->Data()->template Iterate<current::locks::MutexLockStatus::AlreadyLocked>(from_idx)) {
       if (Exists<transaction_t>(stream_record.entry)) {
         const transaction_t& transaction = Value<transaction_t>(stream_record.entry);
         ApplyMutationsFromLockedSectionOrConstructor(transaction, stream_record.idx_ts.us);
@@ -201,7 +235,7 @@ class StreamStreamPersisterImpl final {
   void SubscribeToStreamFromLockedSection() {
     CURRENT_ASSERT(!subscriber_scope_);
     CURRENT_ASSERT(subscriber_instance_);
-    subscriber_scope_ = std::move(stream_->template Subscribe<transaction_t>(*subscriber_instance_));
+    subscriber_scope_ = std::move(stream_controller_->template Subscribe<transaction_t>(*subscriber_instance_));
   }
 
   // Invariant: `master_follower_change_mutex_` is locked.
@@ -213,11 +247,30 @@ class StreamStreamPersisterImpl final {
     last_applied_timestamp_ = timestamp;
   }
 
+  void FlipStarted(std::function<void()> flip_started_callback) {
+    if (flip_started_callback) {
+      flip_started_callback();
+    }
+    publisher_used_ = nullptr;
+  }
+
+  void FlipFinished(std::function<void()> flip_finished_callback) {
+    if (flip_finished_callback) {
+      flip_finished_callback();
+    }
+  }
+
+  void FlipCanceled(std::function<void()> flip_canceled_callback) {
+    if (flip_canceled_callback) {
+      flip_canceled_callback();
+    }
+  }
+
  private:
   fields_update_function_t fields_update_f_;
 
   std::mutex& stream_publishing_mutex_ref_;  // == `stream_->Impl()->publishing_mutex`.
-  Borrowed<stream_t> stream_;
+  controller_t stream_controller_;
   Optional<Borrowed<typename stream_t::publisher_t>> publisher_used_;  // Set iff the storage is the master storage.
 
   mutable std::mutex master_follower_change_mutex_;
@@ -225,8 +278,6 @@ class StreamStreamPersisterImpl final {
   current::stream::SubscriberScope subscriber_scope_;
 
   std::chrono::microseconds last_applied_timestamp_ = std::chrono::microseconds(-1);  // Replayed or from the master.
-
-  HTTPRoutesScope handlers_scope_;
 };
 
 template <typename TYPELIST, typename STREAM_RECORD_TYPE = NoCustomPersisterParam>

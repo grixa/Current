@@ -228,6 +228,13 @@ class StorageImpl {
     return MakeOwned<StorageImpl>(typename persister_t::Following(), CreateStreamAsWell(), std::forward<ARGS>(args)...);
   }
 
+  template <typename... ARGS>
+  static Owned<StorageImpl> CreateFollowingStorageReplicatingRemoteStream(const std::string& url,
+                                                                          stream::SubscriptionMode mode,
+                                                                          ARGS&&... args) {
+    return MakeOwned<StorageImpl>(url, mode, std::forward<ARGS>(args)...);
+  }
+
   static Owned<StorageImpl> CreateMasterStorageAtopExistingStream(Borrowed<stream_t> stream) {
     return MakeOwned<StorageImpl>(typename persister_t::Master(), UseExistingStream(), stream);
   }
@@ -252,6 +259,12 @@ class StorageImpl {
       : owned_stream_(std::move(stream_t::CreateStream(std::forward<ARGS>(args)...))),
         persister_(
             CONSTRUCTION_TYPE(), [this](const fields_variant_t& entry) { entry.Call(fields_); }, Value(owned_stream_)),
+        transaction_policy_(persister_, fields_.current_storage_mutation_journal_) {}
+
+  template <typename... ARGS>
+  StorageImpl(const std::string& url, stream::SubscriptionMode mode, ARGS&&... args)
+      : owned_stream_(std::move(stream_t::CreateStream(std::forward<ARGS>(args)...))),
+        persister_(url, mode, [this](const fields_variant_t& entry) { entry.Call(fields_); }, Value(owned_stream_)),
         transaction_policy_(persister_, fields_.current_storage_mutation_journal_) {}
 
  public:
@@ -311,7 +324,19 @@ class StorageImpl {
         [&f1, this]() { return f1(static_cast<const FIELDS&>(fields_)); }, std::forward<F2>(f2));
   }
 
-  void ExposeRawLogViaHTTP(int port, const std::string& route) { persister_.ExposeRawLogViaHTTP(port, route); }
+  uint64_t ExposeRawLogViaHTTP(int port,
+                               const std::string& route,
+                               stream::MasterFlipRestrictions restrictions = stream::MasterFlipRestrictions(),
+                               std::function<void()> flip_started = nullptr,
+                               std::function<void()> flip_finished = nullptr,
+                               std::function<void()> flip_canceled = nullptr) {
+    return persister_.ExposeRawLogViaHTTP(port, route, restrictions, flip_started, flip_finished, flip_canceled);
+  }
+
+  void FollowRemoteStream(const std::string& route,
+                          stream::SubscriptionMode mode = stream::SubscriptionMode::Unchecked) {
+    persister_.FollowRemoteStream(route, mode);
+  }
 
   Borrowed<stream_t> BorrowUnderlyingStream() const { return persister_.BorrowStream(); }
   const WeakBorrowed<stream_t>& UnderlyingStream() const { return persister_.Stream(); }
@@ -333,10 +358,10 @@ class StorageImpl {
   // as terminating the transactions-replaying stream subscription thread from the following storage
   // neeeds to lock that mutex from the destructor when de-registering its stream subscriber.
   // TODO(dkorolev): Revisit the Stream-related logic here. Flip Stream first!
-  void FlipToMaster() {
+  void FlipToMaster(uint64_t secret_flip_key) {
     // TODO(dkorolev): Lock the mutex.
     // TODO(dkorolev): Start from the stream.
-    persister_.BecomeMasterStorage();
+    persister_.BecomeMasterStorage(secret_flip_key);
   }
 
   void GracefulShutdown() { transaction_policy_.GracefulShutdown(); }
