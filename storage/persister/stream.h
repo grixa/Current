@@ -62,6 +62,8 @@ class StreamStreamPersisterImpl final {
 
     EntryResponse operator()(const transaction_t& transaction, idxts_t current, idxts_t) {
       replay_f_(transaction, current.us);
+      std::cout << "StreamSubscriberImpl " << (void*)this << " index " << current.index << " - " << current.us.count()
+                << std::endl;
       next_replay_index_ = current.index + 1u;
       return EntryResponse::More;
     }
@@ -204,6 +206,8 @@ class StreamStreamPersisterImpl final {
       publisher_used_ =
           stream_controller_->template BecomeFollowingStream<current::locks::MutexLockStatus::AlreadyLocked>();
       const uint64_t save_replay_index = subscriber_instance_->next_replay_index_;
+      std::cout << (void*)subscriber_instance_.get() << "BecomeMasterStorage replay_index " << save_replay_index
+                << ", applied_timestamp " << last_applied_timestamp_.count() << std::endl;
       subscriber_instance_ = nullptr;
       SyncReplayStreamFromLockedSectionOrConstructor(save_replay_index);
     }
@@ -213,10 +217,13 @@ class StreamStreamPersisterImpl final {
   // Invariant: both `subscriber_creator_destructor_mutex_` and `stream_publishing_mutex_ref_` are locked,
   // or the call is taking place from the constructor.
   void SyncReplayStreamFromLockedSectionOrConstructor(uint64_t from_idx) {
+    std::cout << "SyncReplayStreamFromLockedSectionOrConstructor" << std::endl;
     for (const auto& stream_record :
          stream_controller_->Data()->template Iterate<current::locks::MutexLockStatus::AlreadyLocked>(from_idx)) {
       if (Exists<transaction_t>(stream_record.entry)) {
         const transaction_t& transaction = Value<transaction_t>(stream_record.entry);
+        std::cout << "ApplyMutationsFromLockedSectionOrConstructor index " << stream_record.idx_ts.index << ", "
+                  << stream_record.idx_ts.us.count() << std::endl;
         ApplyMutationsFromLockedSectionOrConstructor(transaction, stream_record.idx_ts.us);
       }
     }
@@ -244,6 +251,9 @@ class StreamStreamPersisterImpl final {
 
   void SetLastAppliedTimestampFromLockedSection(std::chrono::microseconds timestamp) {
     CURRENT_ASSERT(timestamp > last_applied_timestamp_);
+    if (timestamp <= last_applied_timestamp_)
+      std::cout << "timestamp is " << timestamp.count() << ", but last_applied_timestamp_ is "
+                << last_applied_timestamp_.count() << std::endl;
     last_applied_timestamp_ = timestamp;
   }
 
@@ -251,6 +261,8 @@ class StreamStreamPersisterImpl final {
     if (flip_started_callback) {
       flip_started_callback();
     }
+    // 1. Serve503
+    // Release the publisher to switch storage to read-only mode
     publisher_used_ = nullptr;
   }
 
@@ -258,12 +270,15 @@ class StreamStreamPersisterImpl final {
     if (flip_finished_callback) {
       flip_finished_callback();
     }
+    std::lock_guard<std::mutex> lock(stream_publishing_mutex_ref_);
+    SubscribeToStreamFromLockedSection();
   }
 
   void FlipCanceled(std::function<void()> flip_canceled_callback) {
     if (flip_canceled_callback) {
       flip_canceled_callback();
     }
+    // how to restore publisher_used_ ?
   }
 
  private:
